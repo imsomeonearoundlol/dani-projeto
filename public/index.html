@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>DANI BLUES — Estoque</title>
+
+  <!-- Tailwind -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: { surface: '#0f1526', line: 'rgba(255,255,255,0.10)' },
+          boxShadow: { soft: '0 10px 25px -5px rgb(0 0 0 / 0.25), 0 8px 10px -6px rgb(0 0 0 / 0.25)' }
+        }
+      }
+    };
+  </script>
+
+  <!-- Tema escuro -->
+  <style>
+    html{ color-scheme: dark; }
+    body{ background:#0b0f1a; color:#e5e7eb; }
+    input, select, textarea { background:#0f1526 !important; color:#e5e7eb !important; border:1px solid rgba(255,255,255,0.12) !important; }
+    input::placeholder, textarea::placeholder { color: rgba(255,255,255,0.5); }
+    select option { background:#0b0f1a; color:#e5e7eb; }
+    input:focus, select:focus, textarea:focus { outline: none !important; border-color: rgba(255,255,255,0.25) !important; box-shadow: 0 0 0 3px rgba(255,255,255,0.12); }
+    input[type="date"]::-webkit-calendar-picker-indicator,
+    input[type="datetime-local"]::-webkit-calendar-picker-indicator { filter: invert(1) opacity(.75); }
+    input:-webkit-autofill, input:-webkit-autofill:hover, input:-webkit-autofill:focus { -webkit-box-shadow: 0 0 0 40px #0f1526 inset !important; -webkit-text-fill-color: #e5e7eb !important; caret-color: #e5e7eb; }
+    *::-webkit-scrollbar { width: 10px; height: 10px; }
+    *::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 8px; }
+    *::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.28); }
+    *::-webkit-scrollbar-track { background: rgba(255,255,255,0.06); }
+  </style>
+
+  <!-- React + Babel -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- jsPDF + autotable -->
+  <script src="https://unpkg.com/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+  <script src="https://unpkg.com/jspdf-autotable@3.8.2/dist/jspdf.plugin.autotable.min.js"></script>
+</head>
+<body class="min-h-screen">
+  <div id="root" class="relative max-w-7xl mx-auto p-4 md:p-8"></div>
+
+  <script type="text/babel">
+    const {useState, useMemo, useEffect} = React;
+
+    // ---------- Utils ----------
+    const currency = (n)=> Number(n||0).toLocaleString('en-GB',{style:'currency',currency:'GBP'});
+    const parseNum = (v)=>{
+      if(typeof v==='number') return v;
+      if(!v && v!==0) return 0;
+      const s = String(v).trim().replace(/[£€$]/g,'').replace(/,/g,'');
+      const n = Number(s);
+      return isNaN(n)?0:n;
+    };
+    const fmtDateTime = (iso)=> new Date(iso).toLocaleString('pt-BR');
+    const fmtDate = (d)=> new Date(d).toISOString().slice(0,10);
+    const todayISO = ()=> fmtDate(new Date());
+    const last30ISO = ()=> fmtDate(new Date(Date.now()-29*24*60*60*1000));
+
+    function productLine(p){
+      if(!p) return 'Outros';
+      const code = String(p.code||'').trim();
+      const name = String(p.name||'').trim();
+      if (code.includes('-')) return code.split('-')[0].trim();
+      const m = name.match(/^(.+?)\s(\d+(\.\d+)?\s?(ml|l|g|kg))$/i);
+      if (m) return m[1].trim();
+      const parts = name.split(' ');
+      if(parts.length>1 && /\d/.test(parts[parts.length-1])) return parts.slice(0,-1).join(' ').trim();
+      return name.split(' ')[0] || 'Outros';
+    }
+
+    // ---------- API ----------
+    async function httpJson(url, opts={}){
+      const r = await fetch(url, opts);
+      let data = null;
+      try { data = await r.json(); } catch(_) {}
+      if(!r.ok){
+        throw new Error((data && (data.error || data.message)) || r.statusText);
+      }
+      return data ?? {};
+    }
+
+    const API = {
+      createProduct: (p)=> httpJson('/api/products', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(p)}),
+      deleteProduct: (id)=> httpJson('/api/products/'+id, {method:'DELETE'}),
+      createMove: (m)=> httpJson('/api/moves', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(m)}),
+      deleteMove: (id)=> httpJson('/api/moves/'+id, {method:'DELETE'}),
+      report: ()=> httpJson('/api/report')
+    };
+
+    // ---------- Cálculo de estoque e financeiro ----------
+    function computeInventory(products, moves){
+      const sorted = [...moves].sort((a,b)=> new Date(a.date_iso) - new Date(b.date_iso));
+      const map = new Map(); const last = new Map();
+      products.forEach(p=> map.set(p.id, { qty:0, avgCost:parseNum(p.base_cost)||0, salePrice:parseNum(p.sale_price)||0 }));
+
+      let revenue=0, cogs=0;
+
+      for(const m of sorted){
+        const st = map.get(m.product_id) || {qty:0, avgCost:0, salePrice:0};
+        const q = parseNum(m.qty);
+        const up = parseNum(m.unit_price);
+        if(m.type==='IN'){
+          const totalBefore = st.qty*st.avgCost, totalAdded = q*(up||st.avgCost), newQty = st.qty+q;
+          st.qty = newQty;
+          st.avgCost = newQty>0 ? (totalBefore+totalAdded)/newQty : st.avgCost;
+        }else{
+          const sellUnit = (up>0 ? up : st.salePrice||0);
+          revenue += q*sellUnit;
+          cogs    += q*st.avgCost;
+          st.qty   = Math.max(0, st.qty - q);
+        }
+        map.set(m.product_id, st);
+        last.set(m.product_id, m.date_iso);
+      }
+
+      const rows = products.map(p=>{
+        const st = map.get(p.id) || {qty:0, avgCost:parseNum(p.base_cost)||0, salePrice:parseNum(p.sale_price)||0};
+        return {
+          productId: p.id,
+          code: p.code,
+          name: p.name,
+          unit: p.unit || 'un',
+          minStock: parseNum(p.min_stock)||0,
+          qty: st.qty,
+          avgCost: st.avgCost,
+          salePrice: st.salePrice,
+          stockValue: st.qty*st.avgCost,
+          lastMoveAt: last.get(p.id)||null
+        };
+      });
+
+      const totals = rows.reduce((a,r)=>{ a.items+=r.qty; a.invValue+=r.stockValue; return a; }, {items:0,invValue:0});
+      totals.revenue = revenue; totals.cogs = cogs; totals.gross = revenue - cogs;
+      return {rows, totals};
+    }
+
+    // ---------- UI ----------
+    const Card = ({title, children, right})=>(
+      <section className="bg-surface border border-line rounded-2xl shadow-soft px-4 py-5 md:p-6 mb-6">
+        <header className="flex items-center justify-between mb-4">
+          <h2 className="text-lg font-semibold tracking-tight">{title}</h2>
+          {right}
+        </header>
+        {children}
+      </section>
+    );
+    const Label = ({children})=> <label className="text-sm text-white/80">{children}</label>;
+    const Input = (props)=> <input {...props} className={"mt-1 w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-white outline-none focus:ring-2 focus:ring-white/20 focus:border-white/20 transition "+(props.className||"")} />;
+    const Select= (props)=> <select {...props} className={"mt-1 w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-white outline-none focus:ring-2 focus:ring-white/20 focus:border-white/20 transition "+(props.className||"")} />;
+    const Button= ({children,variant="primary",type="button",className="",disabled=false,...rest})=>{
+      const base="rounded-lg px-4 py-2 text-sm font-medium transition disabled:opacity-60 disabled:cursor-not-allowed";
+      const styles=variant==="primary"?"bg-white text-black hover:opacity-90 active:opacity-80":variant==="danger"?"bg-red-500/90 text-white hover:bg-red-500":"bg-white/10 text-white hover:bg-white/15";
+      return <button type={type} disabled={disabled} {...rest} className={`${base} ${styles} ${className}`}>{children}</button>;
+    };
+
+    // ---------- Export ----------
+    function exportCSV(filename, headers, rows){
+      const csv=[headers.join(','), ...rows.map(r=>headers.map(h=> (''+r[h]).replace(/\n/g,' ').replace(/,/g,' ')).join(','))].join('\n');
+      const blob=new Blob([csv],{type:'text/csv;charset=utf-8;'}); const url=URL.createObjectURL(blob);
+      const a=document.createElement('a'); a.href=url; a.download=filename; a.click(); URL.revokeObjectURL(url);
+    }
+    function exportPDF_Extrato({company, periodStart, periodEnd, totals, rows}){
+      const { jsPDF } = window.jspdf;
+      const doc = new jsPDF();
+      doc.setFont('helvetica','bold'); doc.setFontSize(16);
+      doc.text(`${company} — Extrato de Entradas & Saídas`, 14, 16);
+      doc.setFont('helvetica','normal'); doc.setFontSize(11);
+      doc.text(`Período: ${periodStart} a ${periodEnd}`, 14, 24);
+      doc.text(`Emitido em: ${new Date().toLocaleString('pt-BR')}`, 14, 30);
+      doc.text(`Entradas: ${totals.inQty} itens • ${currency(totals.inVal)}`, 14, 36);
+      doc.text(`Saídas:   ${totals.outQty} itens • ${currency(totals.outVal)}`, 14, 42);
+      const body = rows.map(r=>[r.date, r.product, r.type, r.qty, r.unit_price, r.line_total, r.note||'']);
+      doc.autoTable({ head:[['Data','Produto','Tipo','Qtd','Preço Unit.','Total Linha','Obs.']], body, startY:48, styles:{ fontSize:9 }, headStyles:{ fillColor:[15,21,38] } });
+      doc.save(`extrato-entradas-saidas-${periodStart}_a_${periodEnd}.pdf`);
+    }
+
+    // ---------- Components ----------
+    function ProductForm({onAdd}){
+      const [code,setCode]=useState(''); const [name,setName]=useState(''); const [unit,setUnit]=useState('un');
+      const [minStock,setMin]=useState(''); const [baseCost,setBase]=useState(''); const [salePrice,setSale]=useState('');
+      const [loading,setLoading]=useState(false);
+
+      async function submit(e){
+        e.preventDefault();
+        if(!code.trim()||!name.trim()) return alert('Informe Código e Nome.');
+        try{
+          setLoading(true);
+          await onAdd({code:code.trim(), name:name.trim(), unit, min_stock:parseNum(minStock), base_cost:parseNum(baseCost), sale_price:parseNum(salePrice)});
+          setCode(''); setName(''); setUnit('un'); setMin(''); setBase(''); setSale('');
+        }catch(err){ alert(err.message); }
+        finally{ setLoading(false); }
+      }
+
+      return (
+        <form onSubmit={submit} className="grid md:grid-cols-6 gap-3">
+          <div className="md:col-span-2"><Label>Código*</Label><Input value={code} onChange={e=>setCode(e.target.value)} placeholder="Ex.: P-001"/></div>
+          <div className="md:col-span-2"><Label>Nome*</Label><Input value={name} onChange={e=>setName(e.target.value)} placeholder="Ex.: Shampoo Protect Care 1L"/></div>
+          <div><Label>Unidade</Label><Input value={unit} onChange={e=>setUnit(e.target.value)} placeholder="un"/></div>
+          <div><Label>Estoque mínimo</Label><Input value={minStock} onChange={e=>setMin(e.target.value)} inputMode="decimal"/></div>
+          <div className="md:col-span-3"><Label>Custo base (£)</Label><div className="relative"><span className="absolute left-3 top-2.5 text-white/50">£</span><Input style={{paddingLeft:'1.6rem'}} value={baseCost} onChange={e=>setBase(e.target.value)} inputMode="decimal" placeholder="0.00"/></div></div>
+          <div className="md:col-span-3"><Label>Preço de venda (£)</Label><div className="relative"><span className="absolute left-3 top-2.5 text-white/50">£</span><Input style={{paddingLeft:'1.6rem'}} value={salePrice} onChange={e=>setSale(e.target.value)} inputMode="decimal" placeholder="0.00"/></div></div>
+          <div className="md:col-span-6"><Button type="submit" disabled={loading}>{loading?'Salvando…':'Adicionar produto'}</Button></div>
+        </form>
+      );
+    }
+
+    function ProductTable({products, onRemove}){
+      if(!products.length) return <p className="text-sm text-white/60">Nenhum produto.</p>;
+      return (
+        <div className="overflow-x-auto">
+          <table className="min-w-full text-sm">
+            <thead><tr className="text-white/70"><th className="py-2 px-3">Código</th><th className="py-2 px-3">Nome</th><th className="py-2 px-3">Un.</th><th className="py-2 px-3">Est. mín.</th><th className="py-2 px-3">Custo base</th><th className="py-2 px-3">Preço venda</th><th className="py-2 px-3"></th></tr></thead>
+            <tbody>{products.map(p=>(
+              <tr key={p.id} className="border-t border-line hover:bg-white/[0.03]">
+                <td className="py-2 px-3 font-medium">{p.code}</td>
+                <td className="py-2 px-3">{p.name}</td>
+                <td className="py-2 px-3">{p.unit||'un'}</td>
+                <td className="py-2 px-3">{p.min_stock||0}</td>
+                <td className="py-2 px-3">{p.base_cost?currency(p.base_cost):'—'}</td>
+                <td className="py-2 px-3">{p.sale_price?currency(p.sale_price):'—'}</td>
+                <td className="py-2 px-3 text-right"><Button variant="danger" onClick={()=>onRemove(p.id)}>remover</Button></td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function MoveForm({products, onAdd, getAvail}){
+      // SEMPRE string (UUID)
+      const firstId = products[0] ? String(products[0].id) : '';
+      const [productId,setPid]=useState(firstId);
+      const [type,setType]=useState('OUT');
+      const [qty,setQty]=useState('');
+      const [unitPrice,setPrice]=useState('');
+      const [dateISO,setDate]=useState(new Date().toISOString().slice(0,16));
+      const [note,setNote]=useState('');
+      const [loading,setLoading]=useState(false);
+
+      const [search,setSearch]=useState('');
+      const [line,setLine]=useState('Todas');
+
+      useEffect(()=>{ if(!productId && products.length) setPid(String(products[0].id)); }, [products]);
+
+      const lines = useMemo(()=>{
+        const s = new Set(products.map(p=>productLine(p)));
+        return ['Todas', ...Array.from(s).sort((a,b)=>a.localeCompare(b))];
+      }, [products]);
+
+      const filtered = useMemo(()=>{
+        const s = search.trim().toLowerCase();
+        return products
+          .filter(p => line==='Todas' || productLine(p)===line)
+          .filter(p => !s || p.name.toLowerCase().includes(s) || String(p.code).toLowerCase().includes(s))
+          .sort((a,b)=> a.name.localeCompare(b.name));
+      }, [products, line, search]);
+
+      useEffect(()=>{
+        if (!filtered.length) return;
+        const exists = filtered.some(p => String(p.id) === String(productId));
+        if (!exists) setPid(String(filtered[0].id));
+      }, [filtered, productId]);
+
+      async function submit(e){
+        e.preventDefault();
+        if (!filtered.length){ alert('Nenhum produto corresponde ao filtro/busca.'); return; }
+        if(!productId || productId==='null'){ alert('Selecione um produto.'); return; }
+
+        const q = parseNum(qty);
+        if(q<=0){ alert('Quantidade > 0'); return; }
+        if(type==='OUT' && q>getAvail(productId)){ alert('Saída maior que saldo.'); return; }
+
+        let up = null;
+        if (type==='IN') {
+          if (parseNum(unitPrice) <= 0) { alert('Preço unitário obrigatório na entrada.'); return; }
+          up = parseNum(unitPrice);
+        } else {
+          up = (unitPrice?.toString().trim()==='') ? null : parseNum(unitPrice);
+        }
+
+        const iso = dateISO ? new Date(dateISO).toISOString() : new Date().toISOString();
+
+        // >>>>> product_id como STRING (UUID) – NÃO converter com Number <<<<<
+        const payload = {
+          product_id: String(productId),
+          type,
+          qty: q,
+          date_iso: iso,
+          note: (note||'').trim()
+        };
+        if (up !== null) payload.unit_price = up;
+
+        try{
+          setLoading(true);
+          await onAdd(payload);
+          setQty(''); setPrice(''); setNote('');
+        }catch(err){
+          console.error('[registrar] falhou', err);
+          alert(err?.message || 'Não foi possível registrar o movimento.');
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      const currentProduct = products.find(p=>String(p.id)===String(productId));
+      const avail = productId ? getAvail(productId) : 0;
+
+      return (
+        <form onSubmit={submit} className="grid md:grid-cols-12 gap-3">
+          <div className="md:col-span-3">
+            <Label>Linha</Label>
+            <Select value={line} onChange={e=>setLine(e.target.value)}>
+              {lines.map(l => <option key={l} value={l}>{l}</option>)}
+            </Select>
+          </div>
+          <div className="md:col-span-3">
+            <Label>Buscar (nome ou código)</Label>
+            <Input value={search} onChange={e=>setSearch(e.target.value)} placeholder="ex.: PROTECT, SHAMPOO, 1L..." />
+          </div>
+
+          <div className="md:col-span-6">
+            <Label>Produto</Label>
+            <div className="relative">
+              <Select value={productId} onChange={e=>setPid(e.target.value)} className="pr-28">
+                {filtered.length===0
+                  ? <option value="">(nenhum encontrado)</option>
+                  : filtered.map(p=>{
+                      const l = productLine(p);
+                      const saldo = getAvail(String(p.id));
+                      const label = `${p.name} — [${p.code}] • saldo ${saldo} ${p.unit||'un'} • ${l}`;
+                      return <option key={p.id} value={String(p.id)}>{label}</option>;
+                    })
+                }
+              </Select>
+              {currentProduct && (
+                <span className="absolute right-2 top-1/2 -translate-y-1/2 text-[11px] px-2 py-0.5 rounded-full border border-white/15 bg-white/5 text-white/70">
+                  {productLine(currentProduct)}
+                </span>
+              )}
+            </div>
+            <p className="text-xs text-white/60 mt-1">
+              Saldo atual: <b className="text-white">{avail}</b> {currentProduct?.unit||'un'}
+            </p>
+          </div>
+
+          <div className="md:col-span-2">
+            <Label>Tipo</Label>
+            <div className="grid grid-cols-2 gap-2 mt-1">
+              <button type="button" onClick={()=>setType('IN')}
+                className={"rounded-lg px-3 py-2 text-sm border "+(type==='IN'?"border-emerald-400 bg-emerald-400/10":"border-white/10 bg-white/5")}>Entrada</button>
+              <button type="button" onClick={()=>setType('OUT')}
+                className={"rounded-lg px-3 py-2 text-sm border "+(type==='OUT'?"border-rose-400 bg-rose-400/10":"border-white/10 bg-white/5")}>Saída</button>
+            </div>
+          </div>
+
+          <div className="md:col-span-2"><Label>Quantidade</Label><Input value={qty} onChange={e=>setQty(e.target.value)} inputMode="decimal" placeholder="0" /></div>
+          <div className="md:col-span-2">
+            <Label>Preço unitário (£)</Label>
+            <div className="relative">
+              <span className="absolute left-3 top-2.5 text-white/50">£</span>
+              <Input style={{paddingLeft:'1.6rem'}} value={unitPrice} onChange={e=>setPrice(e.target.value)} inputMode="decimal" placeholder={type==='OUT'?'(opcional)':'0.00'} />
+            </div>
+            <p className="text-[11px] text-white/50 mt-1">{type==='OUT'?'Opcional na saída (se vazio, usa preço do produto)':'Obrigatório na entrada'}</p>
+          </div>
+          <div className="md:col-span-2"><Label>Data</Label><Input type="datetime-local" value={dateISO} onChange={e=>setDate(e.target.value)} /></div>
+          <div className="md:col-span-6"><Label>Observação</Label><Input value={note} onChange={e=>setNote(e.target.value)} placeholder="pedido #123, cliente X..." /></div>
+
+          <div className="md:col-span-6 self-end">
+            <Button type="submit" className="w-full md:w-auto" disabled={loading}>{loading?'Registrando…':'Registrar movimento'}</Button>
+          </div>
+        </form>
+      );
+    }
+
+    function MoveTable({moves, products, onRemove}){
+      if(!moves.length) return <p className="text-sm text-white/60">Sem movimentos.</p>;
+      const pmap=new Map(products.map(p=>[p.id,p]));
+      const rows=[...moves].sort((a,b)=> new Date(b.date_iso)-new Date(a.date_iso));
+      return (
+        <div className="overflow-x-auto">
+          <table className="min-w-full text-sm">
+            <thead><tr className="text-white/70"><th className="py-2 px-3">Data</th><th className="py-2 px-3">Produto</th><th className="py-2 px-3">Tipo</th><th className="py-2 px-3">Qtd</th><th className="py-2 px-3">Preço Unit.</th><th className="py-2 px-3">Obs.</th><th></th></tr></thead>
+            <tbody>{rows.map(m=>(
+              <tr key={m.id} className="border-t border-line hover:bg-white/[0.03]">
+                <td className="py-2 px-3 whitespace-nowrap">{fmtDateTime(m.date_iso)}</td>
+                <td className="py-2 px-3">{pmap.get(m.product_id)?.name||'—'}</td>
+                <td className="py-2 px-3"><span className={"inline-flex items-center px-2 py-0.5 rounded-full text-xs "+(m.type==='IN'?"bg-emerald-400/10 text-emerald-300 border border-emerald-400/30":"bg-rose-400/10 text-rose-300 border border-rose-400/30")}>{m.type==='IN'?'Entrada':'Saída'}</span></td>
+                <td className="py-2 px-3">{m.qty}</td>
+                <td className="py-2 px-3">{m.unit_price?currency(m.unit_price):'—'}</td>
+                <td className="py-2 px-3">{m.note||'—'}</td>
+                <td className="py-2 px-3 text-right"><Button variant="danger" onClick={()=>onRemove(m.id)}>remover</Button></td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      );
+    }
+
+    function ExtratoES({products, moves}){
+      const [open,setOpen]=useState(false);
+      const [start,setStart]=useState(last30ISO());
+      const [end,setEnd]=useState(todayISO());
+      const [fmt,setFmt]=useState('PDF');
+      const pmap = useMemo(()=> new Map(products.map(p=>[p.id,p])), [products]);
+
+      const filtrados = useMemo(()=>{
+        if(!open) return [];
+        const dStart=new Date(start+'T00:00:00Z'), dEnd=new Date(end+'T23:59:59Z');
+        return moves.filter(m=>{
+          const d=new Date(m.date_iso);
+          return d>=dStart && d<=dEnd;
+        }).sort((a,b)=> new Date(a.date_iso)-new Date(b.date_iso));
+      },[moves,start,end,open]);
+
+      const linhas = useMemo(()=>{
+        return filtrados.map(m=>{
+          const prod = pmap.get(m.product_id);
+          const qty = parseNum(m.qty);
+          let unit = parseNum(m.unit_price || 0);
+          if (!unit && m.type === 'OUT' && prod) unit = parseNum(prod.sale_price || 0);
+          const total = qty * unit;
+          return {
+            id:m.id,
+            date: new Date(m.date_iso).toLocaleDateString('pt-BR'),
+            product: prod ? `${prod.name} (${prod.code})` : '—',
+            type: m.type==='IN' ? 'Entrada' : 'Saída',
+            qty,
+            unit_price: unit ? Number(unit).toFixed(2) : '0.00',
+            line_total: Number(total||0).toFixed(2),
+            note: m.note || ''
+          };
+        });
+      },[filtrados,pmap]);
+
+      const totals = useMemo(()=>{
+        return linhas.reduce((a,r)=>{
+          const isIn = r.type==='Entrada';
+          a[isIn?'inQty':'outQty'] += r.qty;
+          a[isIn?'inVal':'outVal'] += parseNum(r.line_total);
+          return a;
+        }, {inQty:0,inVal:0,outQty:0,outVal:0});
+      },[linhas]);
+
+      function gerar(){
+        if(linhas.length===0){ alert('Sem movimentos no período.'); return; }
+        if(fmt==='CSV'){
+          exportCSV(`extrato-entradas-saidas-${start}_a_${end}.csv`,
+            ['date','product','type','qty','unit_price','line_total','note'],
+            linhas
+          );
+        }else{
+          exportPDF_Extrato({ company:'DANI BLUES', periodStart:start, periodEnd:end, totals, rows: linhas });
+        }
+      }
+
+      return (
+        <Card title="Extrato (Entrada/Saída)" right={<Button onClick={()=>setOpen(v=>!v)}>{open?'Fechar Extrato':'Abrir Extrato'}</Button>}>
+          {open && (
+            <>
+              <div className="grid md:grid-cols-8 gap-3 mb-4">
+                <div className="md:col-span-2"><Label>De</Label><Input type="date" value={start} onChange={e=>setStart(e.target.value)} /></div>
+                <div className="md:col-span-2"><Label>Até</Label><Input type="date" value={end} onChange={e=>setEnd(e.target.value)} /></div>
+                <div className="md:col-span-2"><Label>Formato</Label>
+                  <Select value={fmt} onChange={e=>setFmt(e.target.value)}><option>PDF</option><option>CSV</option></Select>
+                </div>
+                <div className="md:col-span-2 flex items-end"><Button className="w-full" onClick={gerar}>Gerar</Button></div>
+              </div>
+
+              {linhas.length>0 ? (
+                <>
+                  <div className="grid md:grid-cols-3 gap-3 mb-3">
+                    <div className="rounded-xl border border-line bg-white/5 p-4">
+                      <div className="text-xs text-white/60">Entradas (£)</div>
+                      <div className="mt-1 text-lg font-semibold">{currency(totals.inVal)}</div>
+                      <div className="text-xs text-white/50">Qtd: {totals.inQty}</div>
+                    </div>
+                    <div className="rounded-xl border border-line bg-white/5 p-4">
+                      <div className="text-xs text-white/60">Saídas (£)</div>
+                      <div className="mt-1 text-lg font-semibold">{currency(totals.outVal)}</div>
+                      <div className="text-xs text-white/50">Qtd: {totals.outQty}</div>
+                    </div>
+                    <div className="rounded-xl border border-line bg-white/5 p-4">
+                      <div className="text-xs text-white/60">Período</div>
+                      <div className="mt-1 text-sm">{start} → {end}</div>
+                      <div className="text-xs text-white/50">Movimentos: {linhas.length}</div>
+                    </div>
+                  </div>
+
+                  <div className="overflow-x-auto">
+                    <table className="min-w-full text-sm">
+                      <thead><tr className="text-white/70"><th className="py-2 px-3">Data</th><th className="py-2 px-3">Produto</th><th className="py-2 px-3">Tipo</th><th className="py-2 px-3">Qtd</th><th className="py-2 px-3">Preço Unit.</th><th className="py-2 px-3">Total Linha</th><th className="py-2 px-3">Obs.</th></tr></thead>
+                      <tbody>{linhas.map(r=>(
+                        <tr key={r.id} className="border-t border-line hover:bg-white/[0.03]">
+                          <td className="py-2 px-3">{r.date}</td>
+                          <td className="py-2 px-3">{r.product}</td>
+                          <td className="py-2 px-3">
+                            <span className={"inline-flex items-center px-2 py-0.5 rounded-full text-xs "+(r.type==='Entrada'?"bg-emerald-400/10 text-emerald-300 border border-emerald-400/30":"bg-rose-400/10 text-rose-300 border border-rose-400/30")}>{r.type}</span>
+                          </td>
+                          <td className="py-2 px-3">{r.qty}</td>
+                          <td className="py-2 px-3">{currency(Number(r.unit_price)||0)}</td>
+                          <td className="py-2 px-3">{currency(Number(r.line_total)||0)}</td>
+                          <td className="py-2 px-3">{r.note||'—'}</td>
+                        </tr>
+                      ))}</tbody>
+                    </table>
+                  </div>
+                </>
+              ) : (
+                <p className="text-sm text-white/60">Sem movimentos no período selecionado.</p>
+              )}
+            </>
+          )}
+        </Card>
+      );
+    }
+
+    function StockTable({report}){
+      const rows=[...report.rows].sort((a,b)=> a.name.localeCompare(b.name));
+      if(!rows.length) return <p className="text-sm text-white/60">Cadastre produtos e lance movimentos…</p>;
+      return (
+        <div className="overflow-x-auto">
+          <table className="min-w-full text-sm">
+            <thead><tr className="text-white/70"><th className="py-2 px-3">Código</th><th className="py-2 px-3">Produto</th><th className="py-2 px-3">Saldo</th><th className="py-2 px-3">Un.</th><th className="py-2 px-3">Custo médio</th><th className="py-2 px-3">Preço venda</th><th className="py-2 px-3">Valor em estoque</th><th className="py-2 px-3">Último mov.</th></tr></thead>
+            <tbody>{rows.map(r=>(
+              <tr key={r.productId} className="border-t border-line">
+                <td className="py-2 px-3">{r.code}</td>
+                <td className="py-2 px-3">{r.name}</td>
+                <td className="py-2 px-3">{r.qty}</td>
+                <td className="py-2 px-3">{r.unit}</td>
+                <td className="py-2 px-3">{currency(r.avgCost)}</td>
+                <td className="py-2 px-3">{r.salePrice?currency(r.salePrice):'—'}</td>
+                <td className="py-2 px-3 font-medium">{currency(r.stockValue)}</td>
+                <td className="py-2 px-3 whitespace-nowrap">{r.lastMoveAt? fmtDateTime(r.lastMoveAt):'—'}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      );
+    }
+
+    // ---------- App ----------
+    function App(){
+      const [products,setProducts]=useState([]);
+      const [moves,setMoves]=useState([]);
+      const [showCadastro,setShowCadastro]=useState(false);
+      const [showMovimentos,setShowMovimentos]=useState(false);
+      const [loading,setLoading]=useState(false);
+
+      async function load(){
+        setLoading(true);
+        try{
+          const data=await API.report();
+          setProducts(data.products||[]);
+          setMoves(data.moves||[]);
+        }catch(err){
+          console.error('[report] erro', err);
+          alert('Falha ao carregar dados: '+err.message);
+        }finally{
+          setLoading(false);
+        }
+      }
+
+      useEffect(()=>{ load(); },[]);
+      const report = useMemo(()=> computeInventory(products, moves), [products, moves]);
+      const getAvail = (pid)=> report.rows.find(r=>String(r.productId)===String(pid))?.qty||0;
+
+      // Parallax leve
+      useEffect(()=>{
+        function onScroll(){
+          const y = window.scrollY || 0;
+          const el = document.getElementById('parallax-bg');
+          if(el) el.style.transform = `translateY(${y*0.2}px)`;
+        }
+        window.addEventListener('scroll', onScroll, {passive:true});
+        onScroll();
+        return ()=> window.removeEventListener('scroll', onScroll);
+      },[]);
+
+      async function addProduct(p){ await API.createProduct(p); await load(); }
+      async function removeProduct(id){ if(confirm('Remover produto e seus movimentos?')){ await API.deleteProduct(id); await load(); } }
+      async function addMove(m){ await API.createMove(m); await load(); }
+      async function removeMove(id){ if(confirm('Remover movimento?')){ await API.deleteMove(id); await load(); } }
+
+      return (
+        <div className="relative">
+          <div id="parallax-bg" aria-hidden="true"
+               className="pointer-events-none absolute -top-24 left-0 right-0 h-48 opacity-40"
+               style={{background:'radial-gradient(1200px 200px at 30% 100%, rgba(99,102,241,0.25), transparent), radial-gradient(800px 200px at 80% 0%, rgba(56,189,248,0.20), transparent)'}}></div>
+
+          <header className="mb-6 relative">
+            <div className="flex items-center justify-between mb-3">
+              <h1 className="text-2xl md:text-3xl font-extrabold tracking-tight">
+                <span className="text-white">DANI BLUES</span>
+                <span className="text-white/60 font-semibold"> • Estoque</span>
+              </h1>
+              <div className="text-sm text-white/60 space-x-3 whitespace-nowrap">
+                <span>Itens: <b className="text-white">{report.totals.items}</b></span>
+                <span>• Inventário: <b className="text-white">{currency(report.totals.invValue)}</b></span>
+                <span>• Vendas: <b className="text-white">{currency(report.totals.revenue)}</b></span>
+                <span>• Lucro bruto: <b className="text-white">{currency(report.totals.gross)}</b></span>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-3">
+              <Button onClick={()=>setShowCadastro(!showCadastro)}>{showCadastro?'Fechar Cadastro de Produtos':'Abrir Cadastro de Produtos'}</Button>
+              <Button onClick={()=>setShowMovimentos(!showMovimentos)}>{showMovimentos?'Fechar Registrar Entrada/Saída':'Abrir Registrar Entrada/Saída'}</Button>
+            </div>
+          </header>
+
+          {loading && (<div className="mb-4 text-sm text-white/70">Carregando…</div>)}
+
+          {showCadastro && (
+            <Card title="Cadastro de Produtos">
+              <ProductForm onAdd={addProduct} />
+              <div className="mt-4"><ProductTable products={products} onRemove={removeProduct} /></div>
+            </Card>
+          )}
+
+          {showMovimentos && (
+            <Card title="Registrar Entrada/Saída" right={<span className="text-xs text-white/60">Entrada = compras/estoque inicial • Saída = venda/consumo</span>}>
+              {products.length===0
+                ? <p className="text-sm text-white/60">Cadastre um produto para lançar movimentos.</p>
+                : <MoveForm products={products} onAdd={addMove} getAvail={getAvail} />}
+              <div className="mt-4"><MoveTable moves={moves} products={products} onRemove={removeMove} /></div>
+            </Card>
+          )}
+
+          <ExtratoES products={products} moves={moves} />
+
+          <Card title="Estoque & Financeiro (Custo Médio)">
+            <StockTable report={report} />
+          </Card>
+
+          <footer className="text-xs text-white/50 mt-8">Rodando local com Postgres. Dados persistem no volume. Moeda: £ (GBP).</footer>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App/>);
+  </script>
+</body>
+</html>
