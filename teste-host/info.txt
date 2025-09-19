@@ -1,0 +1,59 @@
+Front-end (app no navegador)
+
+HTML5 + CSS (tema escuro custom)
+
+Tailwind CSS (via CDN, com tailwind.config inline)
+
+JavaScript ES6+
+
+React 18 (UMD) + ReactDOM 18
+
+Babel Standalone (transpila JSX no browser)
+
+Fetch API (chamadas à API)
+
+jsPDF + jspdf-autotable (exportar PDF)
+
+CSV export (gera Blob e baixa arquivo)
+
+Pequenos efeitos parallax (JS puro)
+
+Back-end (API)
+
+Node.js (v22 foi o que apareceu nos logs)
+
+Express (servidor HTTP e rotas /api/products, /api/moves, /api/report)
+
+pg / pg-pool (client PostgreSQL)
+
+dotenv (variáveis em .env)
+
+CORS e JSON parsing (middleware do Express)
+
+Banco de dados & Infra
+
+PostgreSQL 16
+
+Docker Compose (container do Postgres + volume para persistência)
+
+Volumes do Docker (dados do banco persistem)
+
+Arquivo schema.sql (DDL das tabelas)
+
+Build/Run & Sistema
+
+npm (npm start roda node server.js)
+
+Windows (ambiente onde você está rodando)
+
+.env para credenciais (ex.: POSTGRES_PASSWORD, DB_*)
+
+Padrões/Modelo de dados
+
+Produtos e Movimentos (IN/OUT)
+
+Custo médio ponderado (recalcula a cada Entrada)
+
+Estoque atual, Inventário (custo), Vendas (receita), COGS e Lucro bruto (derivados dos movimentos)
+
+Relatórios por período (PDF/CSV
